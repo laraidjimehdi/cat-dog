@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cat / Dog Recognition (ESP32-CAM)</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align:center; margin: 20px; }
+    h1 { margin-bottom: 10px; }
+    #wrap { display:flex; justify-content:center; gap:30px; flex-wrap:wrap; align-items:flex-start; }
+    #left { min-width: 320px; }
+    #right { min-width: 320px; text-align:right; }
+    img { width: 320px; height: 240px; border: 1px solid #ccc; border-radius: 8px; object-fit: cover; background:#f7f7f7; }
+    button, input { padding: 10px 14px; margin: 6px; font-size: 15px; }
+    button { cursor:pointer; }
+    .ok { color: #0a7; font-weight: bold; }
+    .bad { color: #c00; font-weight: bold; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; white-space: pre-wrap; text-align:left; direction:ltr; }
+    .row { margin: 10px 0; }
+    .pill { display:inline-block; padding:4px 10px; border-radius:999px; background:#f2f2f2; }
+    .small { font-size: 13px; color:#666; line-height: 1.6; }
+    .warn { background:#fff3cd; border:1px solid #ffeeba; padding:10px; border-radius:8px; text-align:right; }
+    a { color:#06c; }
+  </style>
+</head>
+
+<body>
+  <h1>Cat / Dog Recognition</h1>
+
+  <div class="row warn">
+    <b>مهم:</b> هذه الصفحة تعمل من GitHub Pages، لكن الوصول إلى ESP32 يعتمد على شبكتك.
+    لازم الجهاز الذي يفتح الصفحة يكون على <b>نفس الواي فاي</b> مع ESP32، وإلا ستظهر <b>Failed to fetch</b>.
+  </div>
+
+  <div class="row">
+    <label>ESP IP:</label>
+    <input id="ipInput" type="text" value="10.34.96.42" style="width:160px;text-align:center" />
+    <button id="btnSaveIp">تحديث IP</button>
+    <span class="pill">Current: <span id="espIp"></span></span>
+  </div>
+
+  <div class="row">
+    <button id="btnStart">Start</button>
+    <button id="btnStop" disabled>Stop</button>
+    <button id="btnTest">Test /capture</button>
+  </div>
+
+  <div class="row small" id="bootMsg">Loading model…</div>
+
+  <div id="wrap">
+    <div id="left">
+      <div class="row">ESP32-CAM Snapshot</div>
+      <img id="espImg" alt="ESP32-CAM" crossorigin="anonymous" />
+      <div class="row"><span id="status" class="bad">Stopped</span></div>
+      <div class="row small">Test link: <span id="capLink"></span></div>
+    </div>
+
+    <div id="right">
+      <div class="row">
+        <div><b>Prediction</b></div>
+        <div>DOG: <span id="dogP">-</span></div>
+        <div>CAT: <span id="catP">-</span></div>
+        <div>BACKGROUND: <span id="bgP">-</span></div>
+      </div>
+
+      <div class="row">
+        <div><b>Settings</b></div>
+        <div>Threshold: <span id="thrV"></span></div>
+        <div>Margin: <span id="marV"></span></div>
+        <div>Streak: <span id="stkV"></span></div>
+        <div>Cooldown(ms): <span id="coolV"></span></div>
+        <div>Snapshot every(ms): <span id="snapV"></span></div>
+      </div>
+
+      <div class="row">
+        <div><b>Log</b></div>
+        <div id="log" class="mono"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TensorFlow.js + Teachable Machine -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+
+  <script>
+    // ====== إعدادات ثابتة ======
+    const ESP_TOKEN = "1234";
+    const MODEL_BASE_URL = "https://teachablemachine.withgoogle.com/models/a9m7ZlNff/"; // غيّره إذا موديلك مختلف
+    const BACKGROUND_LABEL = "BACKGROUND";
+
+    const THRESHOLD = 0.95;
+    const MARGIN = 0.20;
+    const STREAK_N = 3;
+    const COOLDOWN_MS = 3000;
+
+    const SNAPSHOT_EVERY_MS = 1200;
+    const BG_THRESHOLD = 0.90;
+
+    let ESP_IP = localStorage.getItem("ESP_IP") || document.getElementById("ipInput").value;
+
+    let model, running = false, timer = null;
+    let lastCommandAt = 0, lastSent = "";
+    let streakLabel = "", streakCount = 0;
+
+    const espImg = document.getElementById("espImg");
+    const statusEl = document.getElementById("status");
+    const dogPEl = document.getElementById("dogP");
+    const catPEl = document.getElementById("catP");
+    const bgPEl  = document.getElementById("bgP");
+    const logEl = document.getElementById("log");
+    const btnStart = document.getElementById("btnStart");
+    const btnStop = document.getElementById("btnStop");
+    const btnTest = document.getElementById("btnTest");
+    const bootMsg = document.getElementById("bootMsg");
+
+    document.getElementById("thrV").textContent = THRESHOLD;
+    document.getElementById("marV").textContent = MARGIN;
+    document.getElementById("stkV").textContent = STREAK_N;
+    document.getElementById("coolV").textContent = COOLDOWN_MS;
+    document.getElementById("snapV").textContent = SNAPSHOT_EVERY_MS;
+
+    function refreshUIIp() {
+      document.getElementById("espIp").textContent = ESP_IP;
+      const capUrlBase = `http://${ESP_IP}/capture`;
+      document.getElementById("capLink").innerHTML = `<a href="${capUrlBase}" target="_blank">${capUrlBase}</a>`;
+      document.getElementById("ipInput").value = ESP_IP;
+    }
+    refreshUIIp();
+
+    document.getElementById("btnSaveIp").addEventListener("click", () => {
+      ESP_IP = document.getElementById("ipInput").value.trim();
+      localStorage.setItem("ESP_IP", ESP_IP);
+      refreshUIIp();
+      log("تم تحديث IP ✅", true);
+    });
+
+    function log(msg, ok=true) {
+      const t = new Date().toLocaleTimeString();
+      logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+      statusEl.className = ok ? "ok" : "bad";
+      statusEl.textContent = msg;
+    }
+
+    function snapshotUrl() {
+      return `http://${ESP_IP}/capture?ts=${Date.now()}`;
+    }
+
+    async function fetchSnapshotToImage() {
+      const url = snapshotUrl();
+
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 5000);
+
+      let r;
+      try {
+        r = await fetch(url, { mode: "cors", cache: "no-store", signal: ctrl.signal });
+      } finally {
+        clearTimeout(to);
+      }
+
+      if (!r.ok) throw new Error("Snapshot HTTP " + r.status);
+
+      const blob = await r.blob();
+      const objUrl = URL.createObjectURL(blob);
+
+      return new Promise((resolve, reject) => {
+        espImg.onload = () => { URL.revokeObjectURL(objUrl); resolve(true); };
+        espImg.onerror = () => { URL.revokeObjectURL(objUrl); reject(new Error("Cannot load snapshot")); };
+        espImg.src = objUrl;
+      });
+    }
+
+    function prob(preds, name) {
+      const u = (name||"").toUpperCase();
+      const p = preds.find(x => ((x.className||"").toUpperCase() === u));
+      return p ? p.probability : 0;
+    }
+
+    function updateStreak(label) {
+      if (label === streakLabel) streakCount++;
+      else { streakLabel = label; streakCount = 1; }
+    }
+    function resetStreak(){ streakLabel=""; streakCount=0; }
+
+    async function loadModel() {
+      await tf.setBackend("cpu");
+      await tf.ready();
+      log("TF backend: " + tf.getBackend() + " ✅", true);
+
+      const modelURL = MODEL_BASE_URL + "model.json";
+      const metadataURL = MODEL_BASE_URL + "metadata.json";
+      model = await tmImage.load(modelURL, metadataURL);
+      log("Model loaded ✅", true);
+    }
+
+    async function sendCommand(x) {
+      const now = Date.now();
+      if (now - lastCommandAt < COOLDOWN_MS) return;
+      if (x === lastSent) return;
+
+      lastCommandAt = now;
+      lastSent = x;
+
+      const url = `http://${ESP_IP}/cmd?x=${encodeURIComponent(x)}&t=${encodeURIComponent(ESP_TOKEN)}&ts=${Date.now()}`;
+
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 5000);
+
+      let r;
+      try {
+        r = await fetch(url, { mode: "cors", cache: "no-store", signal: ctrl.signal });
+      } finally {
+        clearTimeout(to);
+      }
+
+      const txt = await r.text().catch(()=> "");
+      if (!r.ok) throw new Error(txt || ("HTTP " + r.status));
+      log(`Command sent: ${x.toUpperCase()} ✅ (${txt})`, true);
+    }
+
+    async function loopOnce() {
+      await fetchSnapshotToImage();
+
+      const preds = await model.predict(espImg, false);
+
+      const dog = prob(preds, "DOG");
+      const cat = prob(preds, "CAT");
+      const bg  = prob(preds, BACKGROUND_LABEL);
+
+      dogPEl.textContent = (dog*100).toFixed(1) + "%";
+      catPEl.textContent = (cat*100).toFixed(1) + "%";
+      bgPEl.textContent  = (bg*100).toFixed(1) + "%";
+
+      if (bg >= BG_THRESHOLD) {
+        resetStreak(); lastSent="";
+        log(`${BACKGROUND_LABEL}: ${(bg*100).toFixed(1)}% ✅ (No target)`, false);
+        return;
+      }
+
+      const topLabel = dog >= cat ? "DOG" : "CAT";
+      const topProb  = dog >= cat ? dog : cat;
+      const second   = dog >= cat ? cat : dog;
+      const margin   = topProb - second;
+
+      if (topProb < THRESHOLD || margin < MARGIN) {
+        updateStreak("NONE"); lastSent="";
+        log(`No reliable target (top ${(topProb*100).toFixed(1)}%, margin ${(margin*100).toFixed(1)}%)`, false);
+        return;
+      }
+
+      updateStreak(topLabel);
+
+      if (streakCount >= STREAK_N) {
+        if (topLabel === "DOG") await sendCommand("dog");
+        if (topLabel === "CAT") await sendCommand("cat");
+      } else {
+        log(`Stable check: ${topLabel} (${streakCount}/${STREAK_N})`, true);
+      }
+    }
+
+    async function start() {
+      if (running) return;
+      running = true;
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+
+      try {
+        if (!model) await loadModel();
+        log("Started ✅", true);
+
+        await loopOnce();
+        timer = setInterval(() => {
+          loopOnce().catch(e => log("Error: " + (e.name === "AbortError" ? "Timeout" : e.message) + " ❌", false));
+        }, SNAPSHOT_EVERY_MS);
+
+      } catch (e) {
+        log(`Start error: ${e.message} ❌`, false);
+        stop();
+      }
+    }
+
+    function stop() {
+      running = false;
+      btnStart.disabled = false;
+      btnStop.disabled = true;
+      if (timer) clearInterval(timer);
+      timer = null;
+      resetStreak();
+      log("Stopped.", false);
+    }
+
+    btnStart.addEventListener("click", start);
+    btnStop.addEventListener("click", stop);
+    btnTest.addEventListener("click", () => window.open(`http://${ESP_IP}/capture?ts=${Date.now()}`, "_blank"));
+
+    loadModel()
+      .then(() => bootMsg.textContent = "Ready ✅ اضغط Start")
+      .catch(e => {
+        bootMsg.textContent = "Model load failed ❌";
+        log("Model load failed: " + e.message, false);
+      });
+  </script>
+</body>
+</html>
